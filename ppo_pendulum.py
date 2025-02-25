@@ -1,12 +1,13 @@
 import time
 import signal
 import numpy as np
+import sys
 import torch
 from torch import Tensor
 import torch.nn as nn
 import torch.nn.functional as F
 import gymnasium as gym
-from torch.distributions import Categorical
+from torch.distributions import Normal
 from jaxtyping import Float32
 from util import save_graph
 from tqdm.auto import trange
@@ -64,11 +65,11 @@ def collect_episodes(
     all_rewards: list[Tensor] = []
     all_trajectory_lengths = []
 
-    for loop in trange(num_episodes // num_envs, desc="Collecting episodes..."):
+    for loop in range(num_episodes // num_envs): # , desc="Collecting episodes..."):
         # States come as (num_envs, 4) array
         observation, _ = env.reset()
         done = False
-        states: list[Tensor] = [torch.from_numpy(observation)]
+        states: list[Tensor] = [torch.from_numpy(observation).float()]
         actions: list[Tensor] = []
         action_logprobs: list[Tensor] = []
         rewards: list[Tensor] = []
@@ -77,17 +78,20 @@ def collect_episodes(
         step = 0
         while True:
             _, logits = policy(
-                torch.from_numpy(observation)
+                torch.from_numpy(observation).float()
             )
-            dist = Categorical(logits=logits)
+            # for pendulum, sample from normal distribution
+            # dist_mean = logits[:, 0]
+            dist = convert_logits_to_dist(logits)
             action = dist.sample()
+            clamped_action = action.clamp(min=-2.0, max=2.0)
             logprobs: Tensor = dist.log_prob(action)
 
-            observation, reward, terminated, truncated, info = env.step(action.numpy())
+            observation, reward, terminated, truncated, info = env.step(clamped_action.numpy().reshape(-1, 1))
             action_logprobs.append(logprobs) # already a tensor
             actions.append(action) # already a tensor
-            rewards.append(torch.from_numpy(reward))
-            states.append(torch.from_numpy(observation))
+            rewards.append(torch.from_numpy(reward).float())
+            states.append(torch.from_numpy(observation).float())
 
             for i in range(num_envs):
                 if (terminated[i] or truncated[i]) and termination_idxs[i] is None:
@@ -151,6 +155,11 @@ def compute_advantage(
 
     return advantages
 
+def convert_logits_to_dist(
+    logits
+):
+    loc = 2.0 * torch.tanh(logits[..., 0])
+    return Normal(loc, 0.5)
 
 def apply_policy(
     policy,
@@ -159,30 +168,48 @@ def apply_policy(
 ):
     mask = torch.arange(padded_states.shape[1]).view(1, -1) >= torch.tensor(trajectory_lengths).view(-1, 1)
     values, logits = policy(padded_states)
-    logprobs = torch.log_softmax(logits, dim=-1)
+    dist = convert_logits_to_dist(logits)
+    action = dist.sample()
+    logprobs: Tensor = dist.log_prob(action)
+    values = values.squeeze(-1).masked_fill(mask, 0)
+    return logprobs, values
+
+def get_action_logprobs_and_values(
+    policy,
+    padded_actions,
+    padded_states,
+    trajectory_lengths
+):
+    # like apply_policy, but the actions are fixed
+    mask = torch.arange(padded_states.shape[1]).view(1, -1) >= torch.tensor(trajectory_lengths).view(-1, 1)
+    values, logits = policy(padded_states)
+    dist = convert_logits_to_dist(logits)
+    logprobs: Tensor = dist.log_prob(padded_actions)
     values = values.squeeze(-1)
     values.masked_fill_(mask, 0)
 
-    return logprobs, values
+    return logprobs, values, dist.scale
 
 if __name__ == "__main__":
     NUM_ENVS = 32
-    NUM_SAMPLES = 1024
+    NUM_SAMPLES = 256
     NUM_OUTER_STEPS = 10_000
     NUM_INNER_STEPS = 5
     CLIP_EPSILON = 0.2
-    VALUE_LOSS_COEFF = 0.5
-    ENTROPY_LOSS_COEFF = 0.01
-    MINIBATCH_SIZE = 64
-    env = gym.make_vec('CartPole-v1', num_envs=NUM_ENVS)
-    policy = PolicyNetwork(4, 2, 1)
+    VALUE_LOSS_COEFF = 0.1
+    ENTROPY_LOSS_COEFF = 1.0
+    MINIBATCH_SIZE = 32
+    env = gym.make_vec('Pendulum-v1', num_envs=NUM_ENVS)
+    policy = PolicyNetwork(in_dim=3, out_dim=1)  # For Pendulum
     optimizer = torch.optim.AdamW(
         policy.parameters()
     )
     all_returns = []
     all_value_losses = []
+    all_means = []
+    all_stds = []
 
-    signal.signal(signal.SIGINT, lambda sig, frame: save_graph(all_returns, all_value_losses) or exit(0))
+    signal.signal(signal.SIGINT, lambda sig, frame: save_graph(all_returns, all_value_losses, all_means, all_stds) or exit(0))
 
     for i in range(NUM_OUTER_STEPS):
         (
@@ -192,16 +219,32 @@ if __name__ == "__main__":
             padded_rewards, # (jagged) num_samples * traj_len
             trajectory_lengths
         ) = collect_episodes(env, policy, NUM_ENVS, NUM_SAMPLES)
+        # After collect_episodes, add:
+        with torch.no_grad():
+            initial_states = padded_states[:, 0]  # Look at first state of each episode
+            _, logits = policy(initial_states)
+            dist = convert_logits_to_dist(logits)
+            all_means.append(dist.loc.mean().item())
+            all_stds.append(dist.scale.mean().item())
+            # print("initial mean", dist.loc.mean().item())
+            # print("initial std", dist.scale.mean().item())
+
         padded_returns = compute_returns(padded_rewards)
+
+        episode_returns = padded_returns[:, 0]
+        avg_return = episode_returns.mean().item()
         mask = torch.arange(padded_returns.shape[1]).view(1, -1) < torch.tensor(trajectory_lengths).view(-1, 1)
 
         # compute advantages once from the episodes
         with torch.no_grad():
             _, padded_values = apply_policy(policy, padded_states, trajectory_lengths)
             fixed_advantages = compute_advantage(padded_rewards, padded_values)
+            # print("fixed mean", fixed_advantages.mean())
+            # print("fixed std", fixed_advantages.std())
+            # sys.exit(0)
             # NEW: normalize advantages
             fixed_advantages = (fixed_advantages - fixed_advantages[mask].mean()) / (fixed_advantages[mask].std() + 1e-8)
-        avg_return = np.mean(trajectory_lengths)
+        # avg_return = np.mean(trajectory_lengths)
         all_returns.append(avg_return)
 
         # do the PPO updates
@@ -216,28 +259,38 @@ if __name__ == "__main__":
                 old_logprobs_chunk = padded_logprobs[batch_idxs]
                 advantages_chunk = fixed_advantages[batch_idxs]
                 returns_chunk = padded_returns[batch_idxs]
-                new_logprobs, new_values = apply_policy(
+                new_logprobs, new_values, dist_std = get_action_logprobs_and_values(
                     policy,
+                    actions_chunk,
                     states_chunk,
                     lengths_chunk
                 )
+
                 mini_mask = torch.arange(states_chunk.shape[1]).view(1, -1) < \
                            torch.tensor(lengths_chunk).view(-1, 1)
 
-                action_new_logprobs: Float32[Tensor, "batch max_len"] = \
-                    new_logprobs.gather(2, actions_chunk.unsqueeze(-1).long()).squeeze(2)
-                ratio: Float32[Tensor, "batch max_len"] = (action_new_logprobs - old_logprobs_chunk).exp()
+
+                # print("about to compute ratio", new_logprobs.shape, "-",  old_logprobs_chunk.shape)
+
+                ratio: Float32[Tensor, "batch max_len"] = (new_logprobs - old_logprobs_chunk).exp()
+
                 pg_term = ratio * advantages_chunk
                 clipped_term = torch.clamp(ratio, 1 - CLIP_EPSILON, 1 + CLIP_EPSILON) * advantages_chunk
                 objective = torch.minimum(pg_term, clipped_term)
 
-                policy_loss = -1 * objective[mini_mask].sum() / mini_mask.sum()
-                value_loss = F.mse_loss(new_values, returns_chunk, reduction="none")[mini_mask].mean()
-                entropy_loss = (new_logprobs.exp() * new_logprobs).sum(dim=-1)[mini_mask].mean()
+                print(f"Ratios min/max: {ratio.min().item():.3f}/{ratio.max().item():.3f}")
+                print(
+                    f"Clipped fraction: {((ratio > 1 + CLIP_EPSILON) | (ratio < 1 - CLIP_EPSILON)).float().mean().item():.3f}")
 
+                policy_loss = -1 * objective[mini_mask].sum() / mini_mask.sum().float()
+                value_loss = F.mse_loss(new_values, returns_chunk, reduction="none")[mini_mask].mean().float()
+                # entropy_loss = (new_logprobs.exp() * new_logprobs).sum(dim=-1)[mini_mask].mean()
+                entropy_loss = 0.5 * torch.log(2 * torch.pi * torch.e * dist_std.pow(2))[mini_mask].mean()
                 # -- backward on loss and step
+                # print("policy_loss", policy_loss.dtype, "value_loss", value_loss.dtype, "entropy", entropy_loss.dtype)
                 combined_loss = policy_loss + VALUE_LOSS_COEFF * value_loss + ENTROPY_LOSS_COEFF * entropy_loss
                 combined_loss.backward()
+                torch.nn.utils.clip_grad_norm_(policy.parameters(), max_norm=0.5)
                 optimizer.step()
                 optimizer.zero_grad()
 
@@ -247,4 +300,4 @@ if __name__ == "__main__":
         all_value_losses.append(total_value_loss)
         print("outer step", i, "returns", avg_return, "val loss", total_value_loss)
 
-    save_graph(all_returns, all_value_losses)
+    save_graph(all_returns, all_value_losses, all_means, all_stds)
